@@ -1,11 +1,15 @@
 // build.rs
 
 extern crate cc;
+use std::env;
 
 fn main() {
+
+    let out_dir = env::var("OUT_DIR").unwrap();
     cc::Build::new()
         .flag_if_supported("-O3")
         //.flag_if_supported("-D_GNU_SOURCE")
+        .flag_if_supported("-lm")
         .flag_if_supported("-Wall")
         .file("src/hapcut2/common.c")
         .file("src/hapcut2/fragmatrix.c")
@@ -14,6 +18,10 @@ fn main() {
         .file("src/hapcut2/hapcut2.c")
         .file("src/hapcut2/logsum10.c")
         .compile("hapcut2");
+
+    println!("cargo:rerun-if-changed=src/hapcut2/hapcut2.c");
+    println!("cargo:rustc-link-search={}", out_dir);
+    println!("cargo:rustc-link-arg-bins=-lhapcut2");
 
     /*cc::Build::new()
         .cpp(true)
