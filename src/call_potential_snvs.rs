@@ -23,7 +23,7 @@ use util::*;
 use variants_and_fragments::*;
 
 pub static VARLIST_CAPACITY: usize = 0; //1000000;
-static VERBOSE: bool = false; //true;
+//static VERBOSE: bool = false; //true;
 
 /// Calls potential SNV sites using a pileup-based genotyping calculation
 ///

@@ -17,11 +17,11 @@ mod errors;
 pub mod estimate_alignment_parameters;
 mod estimate_read_coverage;
 pub mod extract_fragments; //mod extract_fragments_debug;
-mod genotype_probs;
-mod haplotype_assembly;
-mod print_output;
-mod realignment;
-mod util;
-mod variants_and_fragments;
+pub mod genotype_probs;
+pub mod haplotype_assembly;
+pub mod print_output;
+pub mod realignment;
+pub mod util;
+pub mod variants_and_fragments;
 //mod spoa;
 

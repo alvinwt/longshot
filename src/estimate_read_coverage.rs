@@ -30,6 +30,7 @@ use util::{get_interval_lst, print_time, GenomicInterval};
 /// - ```IndexedBamOpenError```: error opening the indexed BAM file
 /// - ```IndexedBamPileupReadError```: error reading a pileup from the indexed BAM
 /// - ```BamHeaderTargetLenAccessError```: error accessing a target (contig) len from BAM header
+#[allow(dead_code)]
 pub fn calculate_mean_coverage(
     bam_file: &String,
     interval: &Option<GenomicInterval>,

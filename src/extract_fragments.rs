@@ -38,7 +38,7 @@ use std::u32;
 use std::usize;
 
 static VERBOSE: bool = false;
-static IGNORE_INDEL_ONLY_CLUSTERS: bool = false;
+//static IGNORE_INDEL_ONLY_CLUSTERS: bool = false;
 
 /// Stores a set of parameters necessary for extracting haplotype fragments, to make it easier
 /// to pass all of the parameters between functions in this module
