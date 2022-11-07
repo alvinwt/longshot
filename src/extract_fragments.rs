@@ -787,16 +787,21 @@ fn extract_var_cluster(
             }
 
             eprint!("; allele = {};", best_allele);
+            eprint!("; allele_scores = [ {}, {} ];", *PHREDProb::from(allele_scores[v][0]), *PHREDProb::from(allele_scores[v][1]));
             eprintln!(" qual = {};", *Prob::from(qual));
         }
 
-        calls.push(FragCall {
-            frag_ix: usize::MAX, // this will be assigned a correct value soon after all fragments extracted
-            var_ix: var_cluster[v as usize].ix,
-            allele: best_allele,
-            qual: qual,
-            one_minus_qual: LogProb::ln_one_minus_exp(&qual)
-        });
+        // hack, revisit this later
+        if allele_scores[v].len() == 2 {
+            calls.push(FragCall {
+                frag_ix: usize::MAX, // this will be assigned a correct value soon after all fragments extracted
+                var_ix: var_cluster[v as usize].ix,
+                allele: best_allele,
+                allele_scores: [allele_scores[v][0], allele_scores[v][1]],
+                qual: qual,
+                one_minus_qual: LogProb::ln_one_minus_exp(&qual)
+            });
+        }
     }
 
     if VERBOSE {
