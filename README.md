@@ -1,6 +1,6 @@
 # longshot (smrest fork)
 
-This is a fork of (https://github.com/pjedge/longshot)[longshot] for use in the [https://github.com/jts/smrest](smrest) mutation caller. It was modified to expose additional data structures, and to use the kprobaln model from HTSlib. End users should not need to use this repository directly. All credit for this code goes to the authors of Longshot, with thanks for providing it under the MIT license for extension and use here.
+This is a fork of [longshot](https://github.com/pjedge/longshot) for use in the [smrest](https://github.com/jts/smrest) mutation caller. It was modified to expose additional data structures, and to use the kprobaln model from HTSlib. End users should not need to use this repository directly. All credit for this code goes to the authors of Longshot, with thanks for providing it under the MIT license for extension and use here.
 
 
 ## citation
