@@ -25,6 +25,7 @@
 use bio::io::fasta;
 use bio::pattern_matching::bndm;
 use bio::stats::{LogProb, PHREDProb, Prob};
+use context_model::ContextModel;
 use errors::*;
 use realignment::*;
 use rust_htslib::bam;
@@ -42,12 +43,14 @@ static VERBOSE: bool = false;
 
 /// Stores a set of parameters necessary for extracting haplotype fragments, to make it easier
 /// to pass all of the parameters between functions in this module
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ExtractFragmentParameters {
     /// minimum mapping quality to use (extract haplotype information for) a read
     pub min_mapq: u8,
     /// type of alignment algorithm to use (viterbi, forward algorithm, numerically stable forward algorithm)
     pub alignment_type: AlignmentType, //
+    /// functions to extract contexts 
+    pub context_model: ContextModel,
     /// band width for the alignment algorithm
     pub band_width: usize,
     /// the length of unique and exact-matching "anchor" sequences to left and right of alignment window.
@@ -241,7 +244,7 @@ pub fn find_anchors(
     ref_seq: &Vec<char>,
     read_seq: &Vec<char>,
     target_names: &Vec<String>,
-    extract_params: ExtractFragmentParameters,
+    extract_params: &ExtractFragmentParameters,
 ) -> Result<Option<AnchorPositions>> {
     //let min_window_length = extract_params.min_window_length;
     let max_window_padding = extract_params.max_window_padding;
@@ -644,11 +647,13 @@ fn generate_haps(var_cluster: &Vec<Var>) -> Vec<Vec<u8>> {
 ///
 fn extract_var_cluster(
     read_seq: &Vec<char>,
+    read_quals: &[u8],
     ref_seq: &Vec<char>,
     var_cluster: Vec<Var>,
+    is_reverse: bool,
     anchors: AnchorPositions,
-    extract_params: ExtractFragmentParameters,
-    align_params: AlignmentParameters,
+    extract_params: &ExtractFragmentParameters,
+    align_params: &AlignmentParameters,
 ) -> Vec<FragCall> {
     let mut calls: Vec<FragCall> = vec![];
 
@@ -658,6 +663,10 @@ fn extract_var_cluster(
     let window_capacity = (anchors.right_anchor_ref - anchors.left_anchor_ref + 10) as usize;
 
     let read_window: Vec<char> = read_seq
+        [(anchors.left_anchor_read as usize)..(anchors.right_anchor_read as usize) + 1]
+        .to_vec();
+
+    let qual_window: Vec<u8> = read_quals
         [(anchors.left_anchor_read as usize)..(anchors.right_anchor_read as usize) + 1]
         .to_vec();
 
@@ -692,29 +701,59 @@ fn extract_var_cluster(
 
     for ref hap in haps {
         assert!(hap.len() > 0);
-        let mut hap_window: Vec<char> = Vec::with_capacity(window_capacity);
-        let mut i: usize = anchors.left_anchor_ref as usize;
+        let context_pad = (extract_params.context_model.k / 2) as u32;
+
+        let mut hap_window_padded: Vec<char> = Vec::with_capacity(window_capacity);
+        let mut i: usize = (anchors.left_anchor_ref - context_pad) as usize;
         for var in 0..n_vars {
             while i < var_cluster[var].pos0 {
-                hap_window.push(ref_seq[i]);
+                hap_window_padded.push(ref_seq[i]);
                 i += 1;
             }
 
             for c in var_cluster[var].alleles[hap[var] as usize].chars() {
-                hap_window.push(c);
+                hap_window_padded.push(c);
             }
 
             i += var_cluster[var].alleles[0].len();
         }
 
-        while i <= anchors.right_anchor_ref as usize {
-            hap_window.push(ref_seq[i]);
+        while i <= (anchors.right_anchor_ref + context_pad) as usize {
+            hap_window_padded.push(ref_seq[i]);
             i += 1;
         }
 
+        // grab the emission parameters for each part of the haplotype sequence
+        // based on the context model
+        let hap_length_no_pad = hap_window_padded.len() - (2 * context_pad) as usize;
+        let mut emissions = Vec::<Vec::<LogProb>>::with_capacity(hap_length_no_pad);
+        let mut hap_window: Vec<char> = Vec::with_capacity(hap_length_no_pad);
+
+        for i in 0..hap_length_no_pad {
+            let context = &hap_window_padded[i..(i + extract_params.context_model.k)];
+            assert!(context.len() == extract_params.context_model.k);
+            let v = context.iter().map(|x| *x as u8).collect::<Vec::<u8>>();
+            
+            
+            if let Some(rank) = extract_params.context_model.get_context_rank(&v, is_reverse) {
+                
+                    let base_log_probs = align_params.context_emission_probs.probs[rank].iter()
+                                            .map(|x| LogProb::from(Prob(*x)))
+                                            .collect::<Vec::<LogProb>>();
+
+                emissions.push(base_log_probs);
+            }
+            hap_window.push(hap_window_padded[i + context_pad as usize]);
+        }
+
+        // if rank could not be computed for some context this will be false
+        // in this case we fall back to a non-context model
+        let valid_emissions = emissions.len() == hap_window.len();
+
         // we now want to score hap_window
-        let score: LogProb = match extract_params.alignment_type {
-            AlignmentType::ForwardAlgorithmNumericallyStable => {
+        let mut score: LogProb = match (extract_params.alignment_type, valid_emissions) {
+            
+            (AlignmentType::ForwardAlgorithmNumericallyStable, _) | (_, false) => {
                 forward_algorithm_numerically_stable(
                     &read_window,
                     &hap_window,
@@ -722,23 +761,58 @@ fn extract_var_cluster(
                     extract_params.band_width,
                 )
             }
-            AlignmentType::ForwardAlgorithmNonNumericallyStable => {
-                forward_algorithm_non_numerically_stable(
-                    &read_window,
+            
+            (AlignmentType::ForwardAlgorithmNumericallyStableWithContext, true) => {
+                // context from base chars to ranks
+                let mut read_window_ranks = Vec::with_capacity(read_window.len());
+                for i in 0..read_window.len() {
+                    read_window_ranks.push(extract_params.context_model.get_base_rank(read_window[i]));
+                }
+
+                forward_algorithm_numerically_stable_with_context(
+                    &read_window_ranks,
                     &hap_window,
-                    align_params,
+                    align_params.ln(),
+                    &emissions,
                     extract_params.band_width,
                 )
             }
-            AlignmentType::ViterbiMaxScoringAlignment => viterbi_max_scoring_alignment(
+
+            (AlignmentType::ForwardAlgorithmNonNumericallyStable, _) => {
+                forward_algorithm_non_numerically_stable(
+                    &read_window,
+                    &hap_window,
+                    align_params.clone(),
+                    extract_params.band_width,
+                )
+            }
+            
+            (AlignmentType::HtsLibProbAln, _) => {
+        
+                // probaln wants a sequence of 0,1,2,3,4, convert alphabet here 
+                let read_t: Vec<u8> = read_window.iter().map(|c| extract_params.context_model.rank_transform.get(*c as u8)).collect();
+                let hap_t: Vec<u8> = hap_window.iter().map(|c| extract_params.context_model.rank_transform.get(*c as u8)).collect();
+                htslib_probaln(
+                    &read_t,
+                    &qual_window,
+                    &hap_t,
+                    extract_params.band_width,
+                )
+            }
+
+
+            (AlignmentType::ViterbiMaxScoringAlignment, _) => viterbi_max_scoring_alignment(
                 &read_window,
                 &hap_window,
                 align_params.ln(),
                 extract_params.band_width,
             ),
         };
-
-        assert!(score > LogProb::ln_zero());
+        
+        // JTS: 2024/01 - the scoring model can fail very rarely, in this case
+        // we provide a default score to allow the program to proceed
+        //assert!(score > LogProb::ln_zero());
+        if score <= LogProb::ln_zero() { score = bio::stats::LogProb(-5.0); }
 
         for var in 0..n_vars {
             allele_scores[var][hap[var] as usize] =
@@ -817,8 +891,8 @@ pub fn extract_fragment(
     vars: Vec<Var>,
     ref_seq: &Vec<char>,
     target_names: &Vec<String>,
-    extract_params: ExtractFragmentParameters,
-    align_params: AlignmentParameters,
+    extract_params: &ExtractFragmentParameters,
+    align_params: &AlignmentParameters,
 ) -> Result<Option<Fragment>> {
     // TODO assert that every single variant in vars is on the same chromosome
     let id: String = u8_to_string(bam_record.qname())?;
@@ -870,7 +944,7 @@ pub fn extract_fragment(
             &ref_seq,
             &read_seq,
             &target_names,
-            extract_params,
+            &extract_params,
         )
         .chain_err(|| "Error while finding anchor sequences.")?
         {
@@ -938,8 +1012,10 @@ pub fn extract_fragment(
         // extract the calls for the fragment
         for call in extract_var_cluster(
             &read_seq,
+            bam_record.qual(),
             ref_seq,
             var_cluster,
+            bam_record.is_reverse(),
             anchors,
             extract_params,
             align_params,
@@ -956,8 +1032,8 @@ pub fn extract_fragments(
     fastafile_name: &String,
     varlist: &mut VarList,
     interval: &Option<GenomicInterval>,
-    extract_params: ExtractFragmentParameters,
-    align_params: AlignmentParameters,
+    extract_params: &ExtractFragmentParameters,
+    align_params: &AlignmentParameters,
 ) -> Result<Vec<Fragment>> {
     let t_names = parse_target_names(&bam_file)?;
 

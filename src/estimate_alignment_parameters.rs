@@ -6,8 +6,10 @@
 //! probabilistic models of proteins and nucleic acids. Cambridge university press.
 
 use bio::io::fasta;
+use bio::stats::{Prob, PHREDProb};
 use errors::*;
 use extract_fragments::{create_augmented_cigarlist, CigarPos};
+use context_model::ContextModel;
 use realignment::*;
 use rust_htslib::bam;
 use rust_htslib::bam::record::Cigar;
@@ -52,13 +54,27 @@ pub struct EmissionCounts {
     not_equal: usize,
 }
 
+/// represents counts of different emissions separated by base
+#[derive(Clone)]
+pub struct ContextEmissionCounts {
+    counts: Vec<Vec<usize>>,
+}
+
+/// represents match/mismatch counts by quality score
+pub struct QualityMatchCounts
+{
+    match_counts: Vec<usize>,
+    mismatch_counts: Vec<usize>
+}
+
 /// a struct to hold counts of transition events and emission events from the BAM file
 ///
 /// together these counts represent all of the counts necessary to estimate the HMM parameters
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AlignmentCounts {
     transition_counts: TransitionCounts,
     emission_counts: EmissionCounts,
+    context_emission_counts: ContextEmissionCounts
 }
 
 impl TransitionCounts {
@@ -132,6 +148,51 @@ impl EmissionCounts {
     }
 }
 
+impl ContextEmissionCounts {
+
+    fn init(cm: & ContextModel) -> ContextEmissionCounts {
+        let n_symbols = cm.num_symbols();
+        let n_contexts = cm.num_contexts();
+
+        ContextEmissionCounts {
+            counts: vec![ vec![0; n_symbols]; n_contexts ]
+        }
+    }
+
+    fn update(&mut self, cm: &ContextModel, context: &[char], is_reverse: bool, emission: char) -> () {
+        assert!(context.len() == cm.k);
+        let v = context.iter().map(|x| *x as u8).collect::<Vec::<u8>>();
+        if let Some(context_rank) = cm.get_context_rank(&v, is_reverse) {
+            let emission_rank = cm.get_base_rank(emission);
+            self.counts[context_rank][emission_rank as usize] += 1;
+        }
+        //println!("updating {:?} {} {} {}", context, context_rank, emission, emission_rank);
+    }
+
+    fn to_probs(&self) -> ContextEmissionProbs {
+        let mut probs = Vec::new();
+        for rank in 0..self.counts.len() {
+            let c = &self.counts[rank];
+            let total: usize = c.iter().sum();
+            let p: Vec::<f64> = c.iter().map(|x| *x as f64 / total as f64).collect();
+            probs.push(p);
+        }
+        
+        ContextEmissionProbs {
+            probs: probs
+        }
+    }
+}
+
+impl QualityMatchCounts {
+    fn init() -> QualityMatchCounts {
+        QualityMatchCounts {
+            match_counts: vec![0; 128],
+            mismatch_counts: vec![0; 128]
+        }
+    }
+}
+
 impl AlignmentCounts {
     /// convert ```AlignmentCounts``` into ```AlignmentParameters``` by converting the transition
     /// and emission counts into probabilities
@@ -139,6 +200,7 @@ impl AlignmentCounts {
         AlignmentParameters {
             transition_probs: self.transition_counts.to_probs(),
             emission_probs: self.emission_counts.to_probs(),
+            context_emission_probs: self.context_emission_counts.to_probs()
         }
     }
 }
@@ -186,7 +248,12 @@ pub fn count_alignment_events(
     cigarpos_list: &Vec<CigarPos>,
     ref_seq: &Vec<char>,
     read_seq: &Vec<char>,
+    quals: &[u8],
     max_cigar_indel: u32,
+    is_reverse: bool,
+    context_emission_counts: &mut ContextEmissionCounts,
+    context_model: &ContextModel,
+    quality_model: &mut QualityMatchCounts
 ) -> Result<(TransitionCounts, EmissionCounts)> {
     // initialize TransitionCounts and EmissionCounts with all counts set to 0
     let mut transition_counts = TransitionCounts {
@@ -239,15 +306,24 @@ pub fn count_alignment_events(
                     // we have transitioned to a match so set the current state to match
                     state = AlignmentState::Match;
 
+                    let q = quals[read_pos] as usize;
                     // check if the aligned bases match or mismatch and use these to iterate the
                     // emission counts (whether bases match or mismatch)
                     if ref_seq[ref_pos] != 'N' && read_seq[read_pos] != 'N' {
                         if ref_seq[ref_pos] == read_seq[read_pos] {
                             emission_counts.equal += 1;
+                            quality_model.match_counts[q] += 1;
                         } else {
                             emission_counts.not_equal += 1;
+                            quality_model.mismatch_counts[q] += 1;
                         }
                     }
+
+                    // update context-specific emission params
+                    assert!(context_model.k % 2 == 1);
+                    let half_k = context_model.k / 2;
+                    let context = &ref_seq[(ref_pos - half_k)..(ref_pos + half_k + 1)];
+                    context_emission_counts.update(context_model, context, is_reverse, read_seq[read_pos]);
 
                     // it's a match operation so both read and reference move forward one position
                     ref_pos += 1;
@@ -379,6 +455,7 @@ pub fn estimate_alignment_parameters(
     min_mapq: u8,
     max_cigar_indel: u32,
     max_reads_estimation: u32, // maximum reads for estimation
+    context_model: &ContextModel
 ) -> Result<AlignmentParameters> {
     let t_names = parse_target_names(&bam_file)?;
 
@@ -403,6 +480,9 @@ pub fn estimate_alignment_parameters(
         equal: 1,
         not_equal: 1,
     };
+
+    let mut context_emission_counts = ContextEmissionCounts::init(context_model);
+    let mut quality_model = QualityMatchCounts::init();
 
     let mut nreads = 0;
 
@@ -457,7 +537,8 @@ pub fn estimate_alignment_parameters(
 
             // count the emission and transition events directly from the record's CIGAR and sequences
             let (read_transition_counts, read_emission_counts) =
-                count_alignment_events(&cigarpos_list, &ref_seq, &read_seq, max_cigar_indel)
+                count_alignment_events(&cigarpos_list, &ref_seq, &read_seq, record.qual(), max_cigar_indel, record.is_reverse(), 
+                                       &mut context_emission_counts, context_model, &mut quality_model)
                     .chain_err(|| "Error counting cigar alignment events.")?;
 
             // add emission and transition counts to the running total
@@ -478,10 +559,49 @@ pub fn estimate_alignment_parameters(
 //	eprintln!("low number of reads for estimating HMM parameters {}",nreads);
     }
 
+    let mut kmers = Vec::new();
+    kmers.push( String::new() );
+
+    for _i in 0..context_model.k {
+        let mut tmp = Vec::new();
+        for s in &kmers {
+            for b in &context_model.alphabet.symbols  {
+                let mut extended = s.clone();
+                extended.push(b as u8 as char);
+                tmp.push(extended);
+            }
+        }
+
+        std::mem::swap(&mut kmers, &mut tmp);
+    }
+
+    eprintln!("raw_qual\tempirical_qual\tobs_error_rate\tmatches\ttotal_bases");
+    for q in 0..50 {
+
+        let m = quality_model.match_counts[q];
+        let x = quality_model.mismatch_counts[q];
+        let t = m + x;
+        let p = if t > 0 { m as f64 / t as f64 } else { 0.0 };
+        let phred = PHREDProb::from(Prob(1.0 - p));
+        eprintln!("{q}\t{:.1}\t{:.4}\t{m}\t{t}", *phred, 1.0 - p);
+    }
+    
+    for kmer in &kmers {
+        
+        for si in 0..=1 {
+            let context_rank = context_model.get_context_rank(kmer.as_bytes(), si != 0).unwrap();
+            let c = &context_emission_counts.counts[context_rank];
+            let total: usize = c.iter().sum();
+            let p: Vec::<f64> = c.iter().map(|x| *x as f64 / total as f64).collect();
+            eprintln!("{kmer}-{} {:.3} {:.3} {:.3} {:.3}", si, p[0], p[1], p[2], p[3]);
+        }
+    }
+
     // place the transition and emission counts together in an AlignmentCounts struct
     let alignment_counts = AlignmentCounts {
         transition_counts: transition_counts,
         emission_counts: emission_counts,
+        context_emission_counts: context_emission_counts
     };
 
     // convert the alignment counts from the BAM into probabilities

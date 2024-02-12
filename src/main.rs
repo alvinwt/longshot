@@ -21,6 +21,7 @@ extern crate hashbrown;
 // import modules
 mod call_genotypes;
 mod call_potential_snvs;
+mod context_model;
 mod errors;
 mod estimate_alignment_parameters;
 mod estimate_read_coverage;
@@ -42,6 +43,7 @@ use errors::*;
 use estimate_alignment_parameters::estimate_alignment_parameters;
 use estimate_read_coverage::calculate_mean_coverage;
 use extract_fragments::ExtractFragmentParameters;
+use context_model::ContextModel;
 use fishers_exact::fishers_exact;
 use genotype_probs::{Genotype, GenotypePriors};
 use haplotype_assembly::*;
@@ -557,9 +559,11 @@ fn run() -> Result<()> {
     // and write to separate files based on set membership
     let store_read_id = out_bam != None;
 
+    let context_model = ContextModel::init(3);
     let extract_fragment_parameters = ExtractFragmentParameters {
         min_mapq,
         alignment_type,
+        context_model,
         band_width,
         anchor_length,
         variant_cluster_max_size: variant_cluster_max_size,
@@ -576,6 +580,7 @@ fn run() -> Result<()> {
         min_mapq,
         max_cigar_indel as u32,
         max_reads_estimation as u32,
+        &extract_fragment_parameters.context_model
     )
     .chain_err(|| "Error estimating alignment parameters.")?;
 
@@ -691,8 +696,8 @@ fn run() -> Result<()> {
         &fasta_file,
         &mut varlist,
         &interval,
-        extract_fragment_parameters,
-        alignment_parameters,
+        &extract_fragment_parameters,
+        &alignment_parameters,
     )
     .chain_err(|| "Error generating haplotype fragments from BAM reads.")?;
 

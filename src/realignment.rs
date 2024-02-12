@@ -2,14 +2,18 @@
 // original author: Ben Pullman
 // modified: Peter Edge, September 2017
 
+use bio::stats::PHREDProb;
+use rust_htslib::htslib::{probaln_par_t, probaln_glocal};
 use bio::stats::{LogProb, Prob};
 use std::f64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AlignmentType {
     ForwardAlgorithmNonNumericallyStable,
+    ForwardAlgorithmNumericallyStableWithContext,
     ForwardAlgorithmNumericallyStable,
     ViterbiMaxScoringAlignment,
+    HtsLibProbAln
 }
 
 // these parameters describe state transition probabilities for a pair HMM
@@ -62,6 +66,11 @@ pub struct EmissionProbs {
     pub deletion: f64,
 }
 
+#[derive(Clone)]
+pub struct ContextEmissionProbs {
+    pub probs: Vec<Vec<f64>>
+}
+
 #[derive(Clone, Copy)]
 pub struct LnEmissionProbs {
     pub equal: LogProb,
@@ -81,10 +90,11 @@ impl EmissionProbs {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct AlignmentParameters {
     pub transition_probs: TransitionProbs,
     pub emission_probs: EmissionProbs,
+    pub context_emission_probs: ContextEmissionProbs
 }
 
 #[derive(Clone, Copy)]
@@ -290,6 +300,143 @@ pub fn forward_algorithm_numerically_stable(
     }
 
     middle_prev[w.len()]
+}
+
+pub fn forward_algorithm_numerically_stable_with_context(
+    v: &Vec<u8>, // unlike w this are not ascii characters but symbol ranks according to some alphabet
+    w: &Vec<char>, 
+    params: LnAlignmentParameters,
+    emissions: &Vec<Vec<LogProb>>,
+    min_band_width: usize,
+) -> LogProb {
+    let len_diff = ((v.len() as i32) - (w.len() as i32)).abs() as usize;
+    let band_width = min_band_width + len_diff;
+
+    let mut lower_prev: Vec<LogProb> = vec![LogProb::ln_zero(); w.len() + 1];
+    let mut middle_prev: Vec<LogProb> = vec![LogProb::ln_zero(); w.len() + 1];
+    let mut upper_prev: Vec<LogProb> = vec![LogProb::ln_zero(); w.len() + 1];
+    let mut lower_curr: Vec<LogProb> = vec![LogProb::ln_zero(); w.len() + 1];
+    let mut middle_curr: Vec<LogProb> = vec![LogProb::ln_zero(); w.len() + 1];
+    let mut upper_curr: Vec<LogProb> = vec![LogProb::ln_zero(); w.len() + 1];
+
+    middle_prev[0] = LogProb::ln_one();
+    let t = params.transition_probs;
+    let e = params.emission_probs;
+
+    upper_prev[1] = params.transition_probs.deletion_from_match;
+    for j in 2..(w.len() + 1) {
+        upper_prev[j] = upper_prev[j - 1] + params.transition_probs.deletion_from_deletion;
+    }
+
+    for i in 1..(v.len() + 1) {
+        let band_middle = (w.len() * i) / v.len();
+        let band_start = if band_middle >= band_width / 2 + 1 {
+            band_middle - band_width / 2
+        } else {
+            1
+        };
+        let band_end = if band_middle + band_width / 2 <= w.len() {
+            band_middle + band_width / 2
+        } else {
+            w.len()
+        };
+
+        if band_start == 1 {
+            middle_curr[0] = LogProb::ln_zero();
+            if i == 1 {
+                lower_curr[0] = params.transition_probs.insertion_from_match
+            } else {
+                lower_curr[0] =
+                    lower_prev[0] + params.transition_probs.insertion_from_insertion;
+            }
+        }
+
+        for j in band_start..(band_end + 1) {
+            let lower_continue = lower_prev[j] + t.insertion_from_insertion;
+            let lower_from_middle = middle_prev[j] + t.insertion_from_match;
+            lower_curr[j] = e.insertion + LogProb::ln_add_exp(lower_continue, lower_from_middle);
+
+            let upper_continue = upper_curr[j - 1] + t.deletion_from_deletion;
+            let upper_from_middle = middle_curr[j - 1] + t.deletion_from_match;
+            upper_curr[j] = e.deletion + LogProb::ln_add_exp(upper_continue, upper_from_middle);
+
+            let middle_from_lower = lower_prev[j - 1] + t.match_from_insertion;
+            let middle_continue = middle_prev[j - 1] + t.match_from_match;
+            let middle_from_upper = upper_prev[j - 1] + t.match_from_deletion;
+            let options3 = [middle_from_lower, middle_continue, middle_from_upper];
+            let match_emission: LogProb = emissions[j - 1][v[i - 1] as usize];
+            
+            //let read_base = "ACGT".as_bytes()[v[i - 1] as usize] as char;
+            //let is_match = read_base == w[j - 1];
+            //println!("{read_base} {} {is_match} {}", w[j - 1], *emissions[j - 1][v[i - 1] as usize]);
+            /*
+            let match_emission: LogProb = if v[i - 1] == w[j - 1] {
+                e.equal
+            } else {
+                e.not_equal
+            };
+            */
+            middle_curr[j] = match_emission + LogProb::ln_sum_exp(&options3);
+        }
+
+        for j in (band_start-1)..(band_end + 1) {
+            upper_prev[j] = upper_curr[j];
+            middle_prev[j] = middle_curr[j];
+            lower_prev[j] = lower_curr[j];
+        }
+        // we previously had a bug at the left boundary of the band... set these to NaN to make sure they
+        // aren't used again
+        if band_start >= 2 {
+            upper_prev[band_start-2] = LogProb(f64::NAN);
+            middle_prev[band_start-2] = LogProb(f64::NAN);
+            lower_prev[band_start-2] = LogProb(f64::NAN);
+        }
+
+        upper_curr[band_start] = LogProb::ln_zero();
+        middle_curr[band_start] = LogProb::ln_zero();
+        lower_curr[band_start] = LogProb::ln_zero();
+    }
+
+    middle_prev[w.len()]
+}
+
+pub fn htslib_probaln(
+    read_packed: &Vec<u8>,
+    read_quals: &Vec<u8>,
+    ref_packed: &Vec<u8>,
+    min_band_width: usize,
+) -> LogProb {
+
+    // Work around probaln_glocal bug when bandwidth is greater than sequence length 
+    let min_seq_len = std::cmp::min(ref_packed.len() as i32, read_packed.len() as i32);
+    let bw = std::cmp::min(min_band_width as i32, min_seq_len - 1);
+
+    let par = probaln_par_t { d: 0.01, e: 0.1, bw: bw as i32};
+    unsafe {
+        //let mut state = vec![0; read_packed.len()];
+        //let mut q = vec![0; read_packed.len()];
+        let p = probaln_glocal(ref_packed.as_ptr(), 
+                               ref_packed.len() as i32, 
+                               read_packed.as_ptr(),
+                               read_packed.len() as i32, 
+                               read_quals.as_ptr(), 
+                               &par, 
+                               std::ptr::null_mut(), /*state.as_mut_ptr(), */
+                               std::ptr::null_mut() /*q.as_mut_ptr()*/);
+    
+        let pp = PHREDProb(p as f64);
+        /*
+        println!("R: {:?} [{}]", read_packed, read_packed.len());
+        println!("H: {:?} [{}]", ref_packed, ref_packed.len());
+        println!("Q: {:?} [{}]", read_quals, read_quals.len());
+        println!("S: {:?}", state.iter().map(|x| x >> 2).collect::<Vec<i32>>());
+        println!("T: {:?}", state.iter().map(|x| x & 3).collect::<Vec<i32>>());
+        println!("q: {:?}", q);
+        println!("P: {}", p);
+        println!("PP: {}", *LogProb::from(pp));
+        */
+        return LogProb::from(pp);
+    }
 }
 
 pub fn viterbi_max_scoring_alignment(
